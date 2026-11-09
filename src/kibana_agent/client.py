@@ -27,7 +27,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import keyring
 import keyring.errors
@@ -590,23 +590,121 @@ def cache_clear_all() -> int:
     return _clear_dir(CACHE_DIR)
 
 
+PROFILE_URLS_KEY = "_kibana_urls"
+PROFILE_API_KEYS_KEY = "_kibana_api_keys"
+
+
+def normalize_kibana_url(value: str, source: str = "KIBANA_URL") -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        raise InvalidOptionError(f"{source} must not be empty")
+
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise InvalidOptionError(
+            f"{source} must contain http(s) Kibana base URL(s) without embedded "
+            "credentials, query, or fragment"
+        )
+    return normalized
+
+
+def parse_kibana_urls(raw: str) -> list[str]:
+    values = [item for item in re.split(r"[,\s]+", raw.strip()) if item]
+    if not values:
+        raise InvalidOptionError("KIBANA_URL must contain at least one Kibana URL")
+
+    urls = [normalize_kibana_url(item) for item in values]
+    if len(set(urls)) != len(urls):
+        raise InvalidOptionError("KIBANA_URL must not contain duplicate URLs")
+    return urls
+
+
+def _parse_api_keys(raw: str, urls: list[str]) -> dict[str, str]:
+    keys = [item.strip() for item in raw.split(",")]
+    if not keys or any(not item for item in keys):
+        raise InvalidOptionError("KIBANA_API_KEY must not contain empty keys")
+
+    if len(keys) == 1:
+        return {url: keys[0] for url in urls}
+    if len(keys) != len(urls):
+        raise InvalidOptionError(
+            "KIBANA_API_KEY must contain either one shared key or one key per KIBANA_URL"
+        )
+    return dict(zip(urls, keys, strict=True))
+
+
+def configured_kibana_urls(profile: dict[str, Any]) -> list[str]:
+    configured = profile.get(PROFILE_URLS_KEY)
+    if isinstance(configured, list) and configured:
+        return [str(item) for item in configured]
+    return [normalize_kibana_url(str(profile.get("kibana_url", "")), "profile kibana_url")]
+
+
+def resolve_profile_endpoint(
+    profile: dict[str, Any],
+    kibana_url: str | None = None,
+) -> dict[str, Any]:
+    """Select one configured Kibana endpoint without mutating the profile."""
+    if kibana_url is None:
+        return profile
+
+    override = normalize_kibana_url(kibana_url, "kibana_url")
+    current = normalize_kibana_url(str(profile.get("kibana_url", "")), "profile kibana_url")
+    if override == current:
+        return profile
+
+    allowed = configured_kibana_urls(profile)
+    if override not in allowed:
+        raise InvalidOptionError("kibana_url is not one of the URLs configured in KIBANA_URL")
+
+    selected = dict(profile)
+    selected["kibana_url"] = override
+    selected.pop(PROFILE_NAME_KEY, None)
+
+    api_keys = profile.get(PROFILE_API_KEYS_KEY)
+    if isinstance(api_keys, dict):
+        api_key = api_keys.get(override)
+        if not api_key:
+            raise AuthError(f"No KIBANA_API_KEY configured for {override}")
+        auth = dict(selected.get("auth", {}))
+        auth["api_key"] = api_key
+        selected["auth"] = auth
+
+    return selected
+
+
 def _profile_from_env() -> dict[str, Any] | None:
     """Build an ephemeral in-memory profile from KIBANA_* env vars, if set.
 
     Recognised env vars:
-      KIBANA_URL                  (required to trigger this path)
+      KIBANA_URL                  (required; one URL or comma/space-separated URLs)
       KIBANA_SPACE                (optional)
       KIBANA_INDEX                (optional default index pattern)
-      KIBANA_USERNAME / KIBANA_PASSWORD          → ``plain`` auth
-      KIBANA_USERNAME_OP_REF / KIBANA_PASSWORD_OP_REF → ``1password`` auth
+      KIBANA_API_KEY              (one shared key, or one comma-separated key per URL)
+      KIBANA_USERNAME / KIBANA_PASSWORD          -> plain auth
+      KIBANA_USERNAME_OP_REF / KIBANA_PASSWORD_OP_REF -> 1password auth
 
-    Returns ``None`` if KIBANA_URL is not set.
+    The first KIBANA_URL is the default endpoint. Additional URLs are trusted
+    per-call targets for the MCP kibana_url argument.
+
+    Returns None if KIBANA_URL is not set.
     """
-    url = os.environ.get("KIBANA_URL")
-    if not url:
+    raw_urls = os.environ.get("KIBANA_URL")
+    if not raw_urls:
         return None
 
-    profile: dict[str, Any] = {"kibana_url": url.rstrip("/")}
+    urls = parse_kibana_urls(raw_urls)
+    profile: dict[str, Any] = {
+        "kibana_url": urls[0],
+        PROFILE_URLS_KEY: urls,
+    }
     if space := os.environ.get("KIBANA_SPACE"):
         profile["space"] = space
     if index := os.environ.get("KIBANA_INDEX"):
@@ -619,7 +717,9 @@ def _profile_from_env() -> dict[str, Any] | None:
     plain_pass = os.environ.get("KIBANA_PASSWORD")
 
     if api_key:
-        profile["auth"] = {"type": "api-key", "api_key": api_key}
+        api_keys = _parse_api_keys(api_key, urls)
+        profile[PROFILE_API_KEYS_KEY] = api_keys
+        profile["auth"] = {"type": "api-key", "api_key": api_keys[urls[0]]}
     elif op_user and op_pass:
         profile["auth"] = {
             "type": "1password",

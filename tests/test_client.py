@@ -188,6 +188,7 @@ class TestResolveProfile:
         for var in (
             "KIBANA_AGENT_PROFILE",
             "KIBANA_URL",
+            "KIBANA_API_KEY",
             "KIBANA_USERNAME",
             "KIBANA_PASSWORD",
             "KIBANA_USERNAME_OP_REF",
@@ -255,6 +256,79 @@ class TestResolveProfile:
             "type": "api-key",
             "api_key": "secret-api-key",
         }
+
+    def test_env_multiple_urls_with_shared_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv(
+            "KIBANA_URL",
+            "https://prd.example, https://stg.example/ https://dr.example",
+        )
+        monkeypatch.setenv("KIBANA_API_KEY", "shared-key")
+
+        prof = resolve_profile()
+
+        assert prof["kibana_url"] == "https://prd.example"
+        assert client.configured_kibana_urls(prof) == [
+            "https://prd.example",
+            "https://stg.example",
+            "https://dr.example",
+        ]
+        assert prof["auth"] == {"type": "api-key", "api_key": "shared-key"}
+
+        selected = client.resolve_profile_endpoint(prof, "https://stg.example/")
+        assert selected["kibana_url"] == "https://stg.example"
+        assert selected["auth"] == {"type": "api-key", "api_key": "shared-key"}
+        assert prof["kibana_url"] == "https://prd.example"
+
+    def test_env_multiple_urls_with_per_endpoint_api_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv("KIBANA_URL", "https://prd.example,https://stg.example")
+        monkeypatch.setenv("KIBANA_API_KEY", "prod-key,stage-key")
+
+        prof = resolve_profile()
+        assert prof["auth"]["api_key"] == "prod-key"
+
+        selected = client.resolve_profile_endpoint(prof, "https://stg.example")
+        assert selected["auth"]["api_key"] == "stage-key"
+        assert prof["auth"]["api_key"] == "prod-key"
+
+    def test_env_multiple_urls_rejects_api_key_count_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv(
+            "KIBANA_URL",
+            "https://prd.example,https://stg.example,https://dr.example",
+        )
+        monkeypatch.setenv("KIBANA_API_KEY", "prod-key,stage-key")
+
+        with pytest.raises(InvalidOptionError, match="one shared key or one key per KIBANA_URL"):
+            resolve_profile()
+
+    def test_env_multiple_urls_rejects_unconfigured_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv("KIBANA_URL", "https://prd.example,https://stg.example")
+        monkeypatch.setenv("KIBANA_API_KEY", "shared-key")
+        prof = resolve_profile()
+
+        with pytest.raises(InvalidOptionError, match="configured in KIBANA_URL"):
+            client.resolve_profile_endpoint(prof, "https://evil.example")
+
+    def test_env_multiple_urls_rejects_duplicates(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._isolate_config(monkeypatch, tmp_path, None)
+        monkeypatch.setenv("KIBANA_URL", "https://prd.example,https://prd.example/")
+        monkeypatch.setenv("KIBANA_API_KEY", "shared-key")
+
+        with pytest.raises(InvalidOptionError, match="duplicate"):
+            resolve_profile()
 
     def test_env_url_plain_creds_builds_ephemeral(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any

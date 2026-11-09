@@ -61,40 +61,71 @@ def test_network_tools_expose_kibana_url_override(tool_name: str) -> None:
     assert signature.parameters["kibana_url"].default is None
 
 
-def test_kibana_url_override_is_ephemeral_and_does_not_mutate_profile(
+def test_list_kibana_endpoints_exposes_urls_but_not_api_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    named_profile: dict[str, Any] = {
-        **FAKE_PROFILE,
-        client.PROFILE_NAME_KEY: "prd",
-        "space": "ops",
+    profile: dict[str, Any] = {
+        "kibana_url": "https://prd.example",
+        client.PROFILE_URLS_KEY: ["https://prd.example", "https://stg.example"],
+        client.PROFILE_API_KEYS_KEY: {
+            "https://prd.example": "prod-secret",
+            "https://stg.example": "stage-secret",
+        },
+        "auth": {"type": "api-key", "api_key": "prod-secret"},
     }
-    monkeypatch.setattr(client, "resolve_profile", lambda name=None: named_profile)
-    monkeypatch.setenv("KIBANA_MCP_ALLOWED_URLS", "https://alternate.example.com")
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: profile)
+
+    result = server.list_kibana_endpoints()
+
+    assert result == {
+        "default_url": "https://prd.example",
+        "endpoints": [
+            {"url": "https://prd.example", "default": True},
+            {"url": "https://stg.example", "default": False},
+        ],
+    }
+    assert "prod-secret" not in repr(result)
+    assert "stage-secret" not in repr(result)
+
+
+def test_kibana_url_override_selects_endpoint_specific_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile: dict[str, Any] = {
+        "kibana_url": "https://prd.example",
+        client.PROFILE_URLS_KEY: ["https://prd.example", "https://stg.example"],
+        client.PROFILE_API_KEYS_KEY: {
+            "https://prd.example": "prod-secret",
+            "https://stg.example": "stage-secret",
+        },
+        "auth": {"type": "api-key", "api_key": "prod-secret"},
+        "space": "ops",
+        "index": "logs-*",
+    }
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: profile)
 
     captured: dict[str, Any] = {}
 
-    def fake_op_search(profile: dict[str, Any], idx: str, **_: Any) -> dict[str, Any]:
-        captured["profile"] = profile
+    def fake_op_search(selected: dict[str, Any], idx: str, **_: Any) -> dict[str, Any]:
+        captured["profile"] = selected
         captured["idx"] = idx
         return {"total": 0, "n": 0, "hits": []}
 
     monkeypatch.setattr(client, "op_search", fake_op_search)
 
-    server.search_logs(kibana_url="  https://alternate.example.com/  ")
+    server.search_logs(kibana_url="https://stg.example/")
 
-    overridden = captured["profile"]
-    assert overridden is not named_profile
-    assert overridden["kibana_url"] == "https://alternate.example.com"
-    assert overridden["auth"] == named_profile["auth"]
-    assert overridden["space"] == "ops"
-    assert overridden["index"] == "logs-*"
-    assert client.PROFILE_NAME_KEY not in overridden
-    assert named_profile["kibana_url"] == "https://kibana.example.com"
-    assert named_profile[client.PROFILE_NAME_KEY] == "prd"
+    selected = captured["profile"]
+    assert selected is not profile
+    assert selected["kibana_url"] == "https://stg.example"
+    assert selected["auth"]["api_key"] == "stage-secret"
+    assert selected["space"] == "ops"
+    assert selected["index"] == "logs-*"
+    assert profile["kibana_url"] == "https://prd.example"
+    assert profile["auth"]["api_key"] == "prod-secret"
 
 
-def test_unlisted_kibana_url_override_is_rejected(
+def test_unconfigured_kibana_url_override_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
@@ -102,10 +133,7 @@ def test_unlisted_kibana_url_override_is_rejected(
     result = server.search_logs(kibana_url="https://untrusted.example.com")
 
     assert result == {
-        "error": (
-            "kibana_url is not allowed; add the trusted endpoint to "
-            "KIBANA_MCP_ALLOWED_URLS"
-        ),
+        "error": "kibana_url is not one of the URLs configured in KIBANA_URL",
         "type": "InvalidOptionError",
     }
 
@@ -114,13 +142,12 @@ def test_kibana_url_override_rejects_non_http_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
-    monkeypatch.setenv("KIBANA_MCP_ALLOWED_URLS", "file:///tmp/fake")
 
     result = server.search_logs(kibana_url="file:///tmp/fake")
 
     assert result == {
         "error": (
-            "kibana_url must be an http(s) Kibana base URL without embedded "
+            "kibana_url must contain http(s) Kibana base URL(s) without embedded "
             "credentials, query, or fragment"
         ),
         "type": "InvalidOptionError",
@@ -289,6 +316,7 @@ def test_tail_logs_passes_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_all_expected_tools_are_registered() -> None:
     """Sanity check: every tool listed in the plan is callable on the module."""
     expected = {
+        "list_kibana_endpoints",
         "search_logs",
         "count_documents",
         "get_histogram",
