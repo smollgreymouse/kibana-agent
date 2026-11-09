@@ -70,6 +70,7 @@ def test_kibana_url_override_is_ephemeral_and_does_not_mutate_profile(
         "space": "ops",
     }
     monkeypatch.setattr(client, "resolve_profile", lambda name=None: named_profile)
+    monkeypatch.setenv("KIBANA_MCP_ALLOWED_URLS", "https://alternate.example.com")
 
     captured: dict[str, Any] = {}
 
@@ -91,6 +92,39 @@ def test_kibana_url_override_is_ephemeral_and_does_not_mutate_profile(
     assert client.PROFILE_NAME_KEY not in overridden
     assert named_profile["kibana_url"] == "https://kibana.example.com"
     assert named_profile[client.PROFILE_NAME_KEY] == "prd"
+
+
+def test_unlisted_kibana_url_override_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+
+    result = server.search_logs(kibana_url="https://untrusted.example.com")
+
+    assert result == {
+        "error": (
+            "kibana_url is not allowed; add the trusted endpoint to "
+            "KIBANA_MCP_ALLOWED_URLS"
+        ),
+        "type": "InvalidOptionError",
+    }
+
+
+def test_kibana_url_override_rejects_non_http_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+    monkeypatch.setenv("KIBANA_MCP_ALLOWED_URLS", "file:///tmp/fake")
+
+    result = server.search_logs(kibana_url="file:///tmp/fake")
+
+    assert result == {
+        "error": (
+            "kibana_url must be an http(s) Kibana base URL without embedded "
+            "credentials, query, or fragment"
+        ),
+        "type": "InvalidOptionError",
+    }
 
 
 def test_same_kibana_url_keeps_named_profile_identity(
