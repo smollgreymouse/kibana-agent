@@ -7,6 +7,7 @@ the JSON-RPC envelope.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -36,6 +37,91 @@ def test_search_logs_recommends_server_side_aggregation() -> None:
     assert "runtime_mappings" in description
     assert "terms" in description
     assert "_truncated" in description
+
+
+NETWORK_TOOLS_WITH_URL_OVERRIDE = [
+    "search_logs",
+    "count_documents",
+    "get_histogram",
+    "get_context",
+    "get_mapping",
+    "list_fields",
+    "list_aliases",
+    "list_data_views",
+    "tail_logs",
+    "raw_es_query",
+    "get_discover_url",
+]
+
+
+@pytest.mark.parametrize("tool_name", NETWORK_TOOLS_WITH_URL_OVERRIDE)
+def test_network_tools_expose_kibana_url_override(tool_name: str) -> None:
+    signature = inspect.signature(getattr(server, tool_name))
+    assert "kibana_url" in signature.parameters
+    assert signature.parameters["kibana_url"].default is None
+
+
+def test_kibana_url_override_is_ephemeral_and_does_not_mutate_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    named_profile: dict[str, Any] = {
+        **FAKE_PROFILE,
+        client.PROFILE_NAME_KEY: "prd",
+        "space": "ops",
+    }
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: named_profile)
+
+    captured: dict[str, Any] = {}
+
+    def fake_op_search(profile: dict[str, Any], idx: str, **_: Any) -> dict[str, Any]:
+        captured["profile"] = profile
+        captured["idx"] = idx
+        return {"total": 0, "n": 0, "hits": []}
+
+    monkeypatch.setattr(client, "op_search", fake_op_search)
+
+    server.search_logs(kibana_url="  https://alternate.example.com/  ")
+
+    overridden = captured["profile"]
+    assert overridden is not named_profile
+    assert overridden["kibana_url"] == "https://alternate.example.com"
+    assert overridden["auth"] == named_profile["auth"]
+    assert overridden["space"] == "ops"
+    assert overridden["index"] == "logs-*"
+    assert client.PROFILE_NAME_KEY not in overridden
+    assert named_profile["kibana_url"] == "https://kibana.example.com"
+    assert named_profile[client.PROFILE_NAME_KEY] == "prd"
+
+
+def test_same_kibana_url_keeps_named_profile_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    named_profile = {**FAKE_PROFILE, client.PROFILE_NAME_KEY: "prd"}
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: named_profile)
+
+    captured: dict[str, Any] = {}
+
+    def fake_op_search(profile: dict[str, Any], idx: str, **_: Any) -> dict[str, Any]:
+        captured["profile"] = profile
+        return {"total": 0, "n": 0, "hits": []}
+
+    monkeypatch.setattr(client, "op_search", fake_op_search)
+    server.search_logs(kibana_url="https://kibana.example.com/")
+
+    assert captured["profile"] is named_profile
+
+
+def test_empty_kibana_url_override_returns_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "resolve_profile", lambda name=None: FAKE_PROFILE)
+
+    result = server.search_logs(kibana_url="  ")
+
+    assert result == {
+        "error": "kibana_url must not be empty",
+        "type": "InvalidOptionError",
+    }
 
 
 def test_search_logs_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
