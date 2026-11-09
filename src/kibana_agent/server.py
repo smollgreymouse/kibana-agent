@@ -14,14 +14,18 @@ argument; if omitted, the server falls back to ``KIBANA_AGENT_PROFILE``, then
 to ``KIBANA_URL``+credential env vars, then to the active profile in the
 config file. Network tools also accept an optional ``kibana_url`` override
 for one call, reusing the resolved profile's credentials and other defaults.
-See :func:`kibana_agent.client.resolve_profile`.
+Alternate endpoints must be explicitly allowlisted in ``KIBANA_MCP_ALLOWED_URLS``
+so an agent cannot redirect credentials to an arbitrary host. See
+:func:`kibana_agent.client.resolve_profile`.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -49,20 +53,55 @@ def safe(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+_URL_OVERRIDE_ALLOWLIST_ENV = "KIBANA_MCP_ALLOWED_URLS"
+
+
+def _normalize_kibana_url(value: str, source: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        raise client.InvalidOptionError(f"{source} must not be empty")
+
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise client.InvalidOptionError(
+            f"{source} must be an http(s) Kibana base URL without embedded "
+            "credentials, query, or fragment"
+        )
+    return normalized
+
+
+def _allowed_override_urls() -> set[str]:
+    raw = os.environ.get(_URL_OVERRIDE_ALLOWLIST_ENV, "")
+    allowed: set[str] = set()
+    for item in raw.replace(",", " ").split():
+        allowed.add(_normalize_kibana_url(item, _URL_OVERRIDE_ALLOWLIST_ENV))
+    return allowed
+
+
 def _resolve(profile: str | None, kibana_url: str | None = None) -> dict[str, Any]:
     resolved = client.resolve_profile(profile)
     if kibana_url is None:
         return resolved
 
-    override = kibana_url.strip().rstrip("/")
-    if not override:
-        raise client.InvalidOptionError("kibana_url must not be empty")
-
+    override = _normalize_kibana_url(kibana_url, "kibana_url")
     current = str(resolved.get("kibana_url", "")).rstrip("/")
     if override == current:
         return resolved
 
-    # Treat a per-call URL override as an ephemeral profile identity.  Removing
+    if override not in _allowed_override_urls():
+        raise client.InvalidOptionError(
+            f"kibana_url is not allowed; add the trusted endpoint to "
+            f"{_URL_OVERRIDE_ALLOWLIST_ENV}"
+        )
+
+    # Treat a per-call URL override as an ephemeral profile identity. Removing
     # the stored profile name keeps response/data-view caches for two Kibana
     # instances separate and avoids attaching notes from the named cluster to
     # the overridden endpoint.
@@ -112,8 +151,9 @@ def search_logs(
     ``search_logs`` hits to analyze them locally: large log records may be
     returned as ``_truncated`` due to the per-document length limit.
 
-    Pass ``kibana_url`` to target another Kibana endpoint for this call while
-    reusing the selected profile's credentials, space, and index defaults.
+    Pass ``kibana_url`` to target an endpoint listed in
+    ``KIBANA_MCP_ALLOWED_URLS`` for this call while reusing the selected
+    profile's credentials, space, and index defaults.
     """
     prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
@@ -189,7 +229,7 @@ def get_context(
     """Compact overview of available indices, aliases, field mappings, and
     recent doc counts. Cached for an hour; pass ``refresh=True`` to bypass
     the cache. Best first call when exploring a new Kibana instance. Pass
-    ``kibana_url`` to inspect another endpoint with the same credentials.
+    ``kibana_url`` to inspect an allowlisted endpoint with the same credentials.
     """
     prof = _resolve(profile, kibana_url)
     return client.op_context(prof, indices=indices, refresh=refresh)
@@ -302,7 +342,8 @@ def raw_es_query(
     Only ``GET`` and a curated set of read-only ``POST`` endpoints are
     permitted (``_search``, ``_count``, ``_field_caps``, ...). All write
     operations are rejected by the same safety guard the CLI uses. Pass
-    ``kibana_url`` to override the endpoint for this call only.
+    ``kibana_url`` to use an endpoint allowlisted in
+    ``KIBANA_MCP_ALLOWED_URLS`` for this call only.
     """
     prof = _resolve(profile, kibana_url)
     data = client.op_raw(prof, method, es_path, body=body)
@@ -322,7 +363,7 @@ def get_discover_url(
 ) -> dict[str, str]:
     """Build a Kibana Discover deep link with a pre-filled query and time range.
 
-    Pass ``kibana_url`` to build the link for another Kibana endpoint.
+    Pass ``kibana_url`` to build the link for an allowlisted Kibana endpoint.
     """
     prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
