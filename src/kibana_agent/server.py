@@ -12,7 +12,9 @@ Launch via the CLI:
 Profile resolution mirrors the CLI: each tool accepts an optional ``profile``
 argument; if omitted, the server falls back to ``KIBANA_AGENT_PROFILE``, then
 to ``KIBANA_URL``+credential env vars, then to the active profile in the
-config file. See :func:`kibana_agent.client.resolve_profile`.
+config file. Network tools also accept an optional ``kibana_url`` override
+for one call, reusing the resolved profile's credentials and other defaults.
+See :func:`kibana_agent.client.resolve_profile`.
 """
 
 from __future__ import annotations
@@ -47,8 +49,27 @@ def safe(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def _resolve(profile: str | None) -> dict[str, Any]:
-    return client.resolve_profile(profile)
+def _resolve(profile: str | None, kibana_url: str | None = None) -> dict[str, Any]:
+    resolved = client.resolve_profile(profile)
+    if kibana_url is None:
+        return resolved
+
+    override = kibana_url.strip().rstrip("/")
+    if not override:
+        raise client.InvalidOptionError("kibana_url must not be empty")
+
+    current = str(resolved.get("kibana_url", "")).rstrip("/")
+    if override == current:
+        return resolved
+
+    # Treat a per-call URL override as an ephemeral profile identity.  Removing
+    # the stored profile name keeps response/data-view caches for two Kibana
+    # instances separate and avoids attaching notes from the named cluster to
+    # the overridden endpoint.
+    overridden = dict(resolved)
+    overridden["kibana_url"] = override
+    overridden.pop(client.PROFILE_NAME_KEY, None)
+    return overridden
 
 
 @mcp.tool()
@@ -65,6 +86,7 @@ def search_logs(
     expand_json: bool = False,
     time_field: str = "@timestamp",
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Search recent logs in a Kibana index pattern.
 
@@ -89,8 +111,11 @@ def search_logs(
     without transferring individual documents. Do not download many
     ``search_logs`` hits to analyze them locally: large log records may be
     returned as ``_truncated`` due to the per-document length limit.
+
+    Pass ``kibana_url`` to target another Kibana endpoint for this call while
+    reusing the selected profile's credentials, space, and index defaults.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_search(
         prof,
@@ -116,9 +141,10 @@ def count_documents(
     kql: str | None = None,
     time_field: str = "@timestamp",
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Count documents matching a query in an index pattern over a time range."""
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     n = client.op_count(
         prof, idx, time_range=last, extra_query=query, kql=kql, time_field=time_field
@@ -136,9 +162,10 @@ def get_histogram(
     kql: str | None = None,
     time_field: str = "@timestamp",
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Date histogram of doc counts. Useful for spotting trends and spikes."""
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_histogram(
         prof,
@@ -157,12 +184,14 @@ def get_context(
     indices: str | None = None,
     refresh: bool = False,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Compact overview of available indices, aliases, field mappings, and
     recent doc counts. Cached for an hour; pass ``refresh=True`` to bypass
-    the cache. Best first call when exploring a new Kibana instance.
+    the cache. Best first call when exploring a new Kibana instance. Pass
+    ``kibana_url`` to inspect another endpoint with the same credentials.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     return client.op_context(prof, indices=indices, refresh=refresh)
 
 
@@ -172,11 +201,12 @@ def get_mapping(
     index_pattern: str | None = None,
     full: bool = False,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Field mapping for an index pattern (flat ``field: type``, deduped by
     common prefix). Pass ``full=True`` for the raw Elasticsearch mapping.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_mapping(prof, idx, full=full)
 
@@ -187,18 +217,22 @@ def list_fields(
     index_pattern: str | None = None,
     glob: str = "*",
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, str]:
     """List field names matching a glob (e.g. ``*.host`` or ``log.*``)."""
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_fields(prof, idx, glob=glob)
 
 
 @mcp.tool()
 @safe
-def list_aliases(profile: str | None = None) -> dict[str, list[str]]:
+def list_aliases(
+    profile: str | None = None,
+    kibana_url: str | None = None,
+) -> dict[str, list[str]]:
     """List all index aliases configured in the Kibana cluster."""
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     return client.op_aliases(prof)
 
 
@@ -207,13 +241,14 @@ def list_aliases(profile: str | None = None) -> dict[str, list[str]]:
 def list_data_views(
     refresh: bool = False,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """List Kibana Data Views visible in the active space.
 
     Use the returned name or id as index_pattern in the other tools;
     kibana-agent resolves it to the Data View's Elasticsearch title.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     return client.op_data_views(prof, refresh=refresh)
 
 
@@ -229,6 +264,7 @@ def tail_logs(
     fields: list[str] | None = None,
     expand_json: bool = False,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Poll for new logs since a cursor (uses ``search_after``).
 
@@ -237,7 +273,7 @@ def tail_logs(
     should pass the ``next_cursor`` from the previous response to fetch only
     newer documents. Returns ``{hits, next_cursor}``.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_tail_page(
         prof,
@@ -259,14 +295,16 @@ def raw_es_query(
     es_path: str,
     body: dict[str, Any] | None = None,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, Any]:
     """Send a raw read-only Elasticsearch request through the Kibana proxy.
 
     Only ``GET`` and a curated set of read-only ``POST`` endpoints are
     permitted (``_search``, ``_count``, ``_field_caps``, ...). All write
-    operations are rejected by the same safety guard the CLI uses.
+    operations are rejected by the same safety guard the CLI uses. Pass
+    ``kibana_url`` to override the endpoint for this call only.
     """
-    prof = _resolve(profile)
+    prof = _resolve(profile, kibana_url)
     data = client.op_raw(prof, method, es_path, body=body)
     return {"data": data}
 
@@ -280,9 +318,13 @@ def get_discover_url(
     lucene: str | None = None,
     fields: list[str] | None = None,
     profile: str | None = None,
+    kibana_url: str | None = None,
 ) -> dict[str, str]:
-    """Build a Kibana Discover deep link with a pre-filled query and time range."""
-    prof = _resolve(profile)
+    """Build a Kibana Discover deep link with a pre-filled query and time range.
+
+    Pass ``kibana_url`` to build the link for another Kibana endpoint.
+    """
+    prof = _resolve(profile, kibana_url)
     idx = client.resolve_index_target(prof, index_pattern)
     return client.op_discover_url(prof, idx, time_range=last, kql=kql, lucene=lucene, fields=fields)
 
